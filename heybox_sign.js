@@ -37,6 +37,7 @@ const PATH_VIEW_TIME = "/bbs/app/link/view/time";
 const POST_SHARE_VIEW_SECONDS = 5;
 const POST_SHARE_VIEW_MILLISECONDS = 5000;
 const SHARE_TASK_SETTLE_MS = 2200;
+const SIGN_STATE_POLL_DELAYS_MS = Object.freeze([800, 1500, 2500, 4000]);
 const TASK_LIST_ERROR_CODE = "HEYBOX_TASK_LIST_INVALID";
 const DAILY_SHARE_TASK_IDS = Object.freeze(["1", "19", "31"]);
 
@@ -282,19 +283,29 @@ async function executeSign(client) {
   }
   const firstState = tools.toText(signResp?.result?.state);
   if (firstState === "ignore") return { ok: true, message: "今日已签到" };
-  await tools.sleep(800);
-  const finalPayload = await client.getJson(PATH_STATE);
-  const status = tools.toText(finalPayload?.status);
-  const result = finalPayload?.result || {};
-  const state = tools.toText(result.state);
-  if (status === OK_STATE && (state === OK_STATE || state === "ignore")) {
-    const parts = [];
-    if (result.sign_in_coin) parts.push(`+${result.sign_in_coin}H币`);
-    if (result.sign_in_exp) parts.push(`+${result.sign_in_exp}经验`);
-    if (result.sign_in_streak) parts.push(`连签${result.sign_in_streak}天`);
-    return { ok: true, message: parts.length ? parts.join(" ") : "签到完成" };
+  let finalPayload;
+  for (const delayMs of SIGN_STATE_POLL_DELAYS_MS) {
+    await tools.sleep(delayMs);
+    finalPayload = await client.getJson(PATH_STATE);
+    const result = finalPayload?.result || {};
+    const state = tools.toText(result.state);
+    if (isOkPayload(finalPayload) && (state === OK_STATE || state === "ignore")) {
+      const parts = [];
+      if (result.sign_in_coin) parts.push(`+${result.sign_in_coin}H币`);
+      if (result.sign_in_exp) parts.push(`+${result.sign_in_exp}经验`);
+      if (result.sign_in_streak) parts.push(`连签${result.sign_in_streak}天`);
+      return { ok: true, message: parts.length ? parts.join(" ") : "签到完成" };
+    }
+    // 只重查 waiting，不重复提交签到；明确错误仍作为失败处理。
+    if (!isOkPayload(finalPayload) || state !== WAITING_STATE) {
+      return { ok: false, message: responseFailure(tools.toText(finalPayload?.msg) || state || tools.toText(finalPayload?.status) || "签到失败", finalPayload) };
+    }
   }
-  return { ok: false, message: responseFailure(tools.toText(finalPayload?.msg) || state || "签到失败", finalPayload) };
+  return {
+    ok: false,
+    pending: true,
+    message: responseFailure("签到状态仍为 waiting，等待任务列表最终确认", finalPayload),
+  };
 }
 
 async function executeSharePost(task, client, fetchSnapshotFn) {
@@ -449,6 +460,7 @@ async function runAccount(account, runtime) {
   const unsupported = new Set();
   const done = new Set();
   const failed = new Set();
+  const pendingSigns = new Set();
   // 支持所有已实现的任务类型（每日任务 + time_limit 任务）
   const allTasks = snapshot.tasks.filter(
     (task) => isDailyTask(task) || TASK_HANDLERS[task.taskId],
@@ -476,11 +488,16 @@ async function runAccount(account, runtime) {
 
     snapshot = result.snapshot || await fetchCurrentSnapshot();
     const after = findTaskByKey(snapshot, key);
-    if (result.ok && after && after.state === FINISH_STATE) {
+    const signAwaitingConfirmation = isSignTask(latestTask) && (result.ok || result.pending);
+    if ((result.ok || signAwaitingConfirmation) && after && after.state === FINISH_STATE) {
       done.add(key);
       const award = latestTask.awardText ? ` 奖励: ${latestTask.awardText}` : "";
-      const extra = result.message ? ` (${result.message})` : "";
+      const message = result.pending ? "任务列表已确认签到完成" : result.message;
+      const extra = message ? ` (${message})` : "";
       account.log(`${after.title}: 已完成${award}${extra}`);
+    } else if (signAwaitingConfirmation) {
+      pendingSigns.add(key);
+      account.log(`${latestTask.title}: 等待确认，任务列表暂未完成 (${result.message})`);
     } else {
       failed.add(key);
       account.log(`${latestTask.title}: 未完成，${result.message}`);
@@ -493,7 +510,16 @@ async function runAccount(account, runtime) {
   const finalTasks = snapshot.tasks.filter((task) => isDailyTask(task) || TASK_HANDLERS[task.taskId]);
   done.clear();
   for (const task of finalTasks) {
-    if (task.state === FINISH_STATE && !failed.has(taskKey(task))) done.add(taskKey(task));
+    const key = taskKey(task);
+    if (pendingSigns.has(key)) {
+      if (task.state === FINISH_STATE) {
+        account.log(`${task.title}: 已完成 (最终任务列表已确认签到完成)`);
+      } else {
+        failed.add(key);
+        account.log(`${task.title}: 未完成，最终任务列表仍为 ${task.state}`);
+      }
+    }
+    if (task.state === FINISH_STATE && !failed.has(key)) done.add(key);
   }
   const waiting = finalTasks.filter((task) => task.state !== FINISH_STATE);
   account.log(
