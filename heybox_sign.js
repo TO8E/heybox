@@ -1,5 +1,7 @@
 /*
 小黑盒 - 每日任务
+name: 小黑盒.每日任务
+cron: 20 7 * * *
 账号环境变量:
   heybox_ck=pkey=xxx;x_xhh_tokenid=xxx;imei=xxx;device_info=xxx;os_version=16;dw=411;channel=heybox_xiaomi;
 */
